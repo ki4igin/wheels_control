@@ -1,269 +1,282 @@
-﻿using System.Collections.Concurrent;
+﻿using System;
+using System.Buffers;
+using System.Buffers.Binary;
+using System.Diagnostics;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
+using System.Threading.Channels;
+using static WheelsControl;
 
+public class VibrPacket(int adc)
+{    
+    public uint Counter;
+    public int[] Data = new int[adc];
+}
 
-
-public struct VibrPacket
+public struct Packet
 {
-
-    private uint id;
-    public uint cnt;
-    public int[] data;
-
-    public VibrPacket(uint adcCnt)
-    {
-        id = 1;
-        cnt = 0;
-        data = new int[adcCnt];
-    }
+    public byte[] Buffer;
+    public int Length;
 }
 
 public class WheelsControl
 {
-
     const int VIBR_ADC_CNT = 8;
 
     const int PORT_CMD = 2020;
     const int PORT_RTD = 2021;
     const int PORT_VIBR = 2022;
 
-    static VibrPacket vibrPacket = new VibrPacket(VIBR_ADC_CNT);
+    const int MAX_PACKET = 2048;
 
-    static int[] vibrData = new int[VIBR_ADC_CNT];
-
-    static UdpClient udpClientCmd;
-    static UdpClient udpClientRtd;
-    static UdpClient udpClientVibr;
-
-    static IPEndPoint groupEPCmd;
-    static IPEndPoint groupEPRtd;
-    static IPEndPoint groupEPVibr;
-    static IPAddress ipAdd;
-
-    static uint[] vibrAdc = new uint[8];
-    static uint vibrCnt = 0;
-
-    public static void Main()
+    public sealed class VibrPacket
     {
-        udpClientCmd = new UdpClient(PORT_CMD);
-        udpClientRtd = new UdpClient(PORT_RTD);
-        udpClientVibr = new UdpClient(PORT_VIBR);
+        public uint Counter;
+        public readonly int[] Data = new int[8];
+    }
 
+    public sealed class RtdPacket
+    {
+        public uint Counter;
+        public readonly int[] Data = new int[8];
+    }
 
-        byte[] ipDefault = { 192, 168, 0, 10 };
+    public sealed class CmdPacket
+    {
+        public DateTime Timestamp;
+        public required string Message;
+        public bool IsIncoming; // true = пришла, false = отправлена
+    }
 
-        ipAdd = new(ipDefault);
-        groupEPCmd = new IPEndPoint(ipAdd, PORT_CMD);
-        groupEPRtd = new IPEndPoint(ipAdd, PORT_RTD);
-        groupEPVibr = new IPEndPoint(ipAdd, PORT_VIBR);
-        //udpClientCmd.Connect(ipAdd, PORT_CMD);
+    static readonly Channel<VibrPacket> vibrChannel = Channel.CreateUnbounded<VibrPacket>();
+    static readonly Channel<RtdPacket> rtdChannel = Channel.CreateUnbounded<RtdPacket>();
+    static readonly Channel<CmdPacket> cmdChannel = Channel.CreateUnbounded<CmdPacket>();
+    static IPAddress deviceIp = IPAddress.Parse("192.168.0.10");
 
+    static uint oldCnt;
+    static uint errCnt;
+    static uint totalCnt;
 
-        Task.Run(() => ReceiveProcessCmd());
-        Task.Run(() => ReceiveProcessVibr());
-        Task.Run(() => ReceiveProcessRtd());
-        Task.Run(() => ParseProcess());
+    static byte adcMask = 0x0F;
+
+    public static async Task Main()
+    {
+        _ = Task.Run(ReceiveVibr);
+        _ = Task.Run(ReceiveRtd);
+        _ = Task.Run(ReceiveCmd);
+
+        _ = Task.Run(() => CmdLoggerLoop());
+        _ = Task.Run(() => WriterRtd());
+        _ = Task.Run(() => WriterVibr());
 
         while (true)
         {
-            var str = Console.ReadLine();
-            Send(str!);
+            var line = Console.ReadLine();
+            if (line != null)
+                await SendCommandAsync(line);
         }
     }
 
-    public static void Send(string str)
+    static async Task ReceiveVibr()
     {
-        if (str.StartsWith("cmd7"))
-        {
-            string ipStr = str.Substring(4).Trim();
-            IPAddress ip = IPAddress.Parse(ipStr);
-            byte[] ipBytes = ip.GetAddressBytes();
-            byte[] bytes4 = Encoding.ASCII.GetBytes("cmd7").Concat(ipBytes).ToArray();
-            udpClientCmd.Send(bytes4);
-            udpClientCmd.Close();
-
-            udpClientCmd = new UdpClient();
-            ipAdd = ip;
-            groupEPCmd = new IPEndPoint(ipAdd, 0);
-            udpClientCmd.Connect(ipAdd, PORT_CMD);
-
-            return;
-
-        }
-
-        if (str.StartsWith("cmd5"))
-        {
-            string dataStr = str.Substring(4).TrimStart();
-            var dataInt = Convert.ToUInt32(dataStr);
-            var dataByte = BitConverter.GetBytes(dataInt);
-            byte[] bytes4 = Encoding.ASCII.GetBytes("cmd5").Concat(dataByte).ToArray();
-            udpClientCmd.Send(bytes4);
-            return;
-        }
-
-        if (str.StartsWith("cmd6"))
-        {
-            string dataStr = str.Substring(4).TrimStart();
-            var dataInt = Convert.ToUInt32(dataStr, 2);
-            var dataByte = BitConverter.GetBytes(dataInt);
-            byte[] bytes4 = Encoding.ASCII.GetBytes("cmd6").Concat(dataByte).ToArray();
-            udpClientCmd.Send(bytes4);
-            return;
-        }
-
-
-        byte[] bytes = Encoding.ASCII.GetBytes(str);
-        udpClientCmd.Send(bytes, bytes.Length, groupEPCmd);
-    }
-
-    static ConcurrentQueue<byte[]> fifo = new();
-
-    public static void ReceiveProcessCmd()
-    {
+        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        socket.Bind(new IPEndPoint(IPAddress.Any, 2022));
 
         while (true)
         {
-            byte[] bytes = udpClientCmd.Receive(ref groupEPCmd);
-            groupEPCmd = new IPEndPoint(ipAdd, PORT_CMD);
-            fifo.Enqueue(bytes);
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(2048);
+            int received = await socket.ReceiveAsync(buffer, SocketFlags.None);
+
+            var pkt = ParseVibr(buffer.AsSpan(0, received));
+            await vibrChannel.Writer.WriteAsync(pkt);
+
+            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
-    public static void ReceiveProcessVibr()
+    static async Task ReceiveRtd()
     {
+        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        socket.Bind(new IPEndPoint(IPAddress.Any, 2021));
 
         while (true)
         {
-            byte[] bytes = udpClientVibr.Receive(ref groupEPVibr);
-            fifo.Enqueue(bytes);
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(2048);
+            int received = await socket.ReceiveAsync(buffer, SocketFlags.None);
+
+            var pkt = ParseRtd(buffer.AsSpan(0, received));
+            await rtdChannel.Writer.WriteAsync(pkt);
+
+            ArrayPool<byte>.Shared.Return(buffer);
         }
     }
 
-    public static void ReceiveProcessRtd()
+    static async Task ReceiveCmd()
     {
+        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
+        socket.Bind(new IPEndPoint(IPAddress.Any, 2020));
 
         while (true)
         {
-            byte[] bytes = udpClientRtd.Receive(ref groupEPRtd);
-            fifo.Enqueue(bytes);
-        }
-    }
+            byte[] buffer = ArrayPool<byte>.Shared.Rent(1024);
+            int received = await socket.ReceiveAsync(buffer, SocketFlags.None);
 
-    public static void ParseProcess()
-    {
-        uint oldCnt = 0;
-        uint cntErr = 0;
-        uint cnt = 0;
-        while (true)
-        {
-            if (fifo.TryDequeue(out byte[]? bytes))
+            var msg = Encoding.ASCII.GetString(buffer, 0, received);
+
+            await cmdChannel.Writer.WriteAsync(new CmdPacket
             {
-                uint id = BitConverter.ToUInt32(bytes, 0);
-                char[] empty = Enumerable.Repeat(' ', Console.WindowWidth - 1).ToArray();
-                if (id == 0x01)
-                {
-                    ParsePacketVibr(bytes);
-                    if (vibrPacket.cnt - oldCnt > 1)
-                    {
-                        cntErr++;
-                    }
-                    oldCnt = vibrPacket.cnt;
+                Timestamp = DateTime.Now,
+                Message = msg,
+                IsIncoming = true
+            });
 
-                    if (++cnt % 256 == 0)
-                    {
-                        Console.CursorVisible = false;
-                        int cursorPosLeft = Console.CursorLeft;
-                        int cursorPosTop = Console.CursorTop;
+            ArrayPool<byte>.Shared.Return(buffer);
+        }
+    }
 
-                        Console.WriteLine();
-                        Console.Write(empty);
-                        Console.WriteLine();
-                        Console.Write(empty);
-                        Console.WriteLine();
-                        Console.Write(empty);
-                        Console.Write("\r");
-                        Console.WriteLine($"Queue len {fifo.Count}");
-                        Console.WriteLine($"Err cnt: {cntErr}");
-                        Console.WriteLine($"Cnt packet: {oldCnt}");
-                        for (int i = 0; i < VIBR_ADC_CNT; i++)
-                        {
-                            Console.Write(empty);
-                            Console.Write("\r");
-                            Console.WriteLine($"Vibr{i + 1}: {vibrPacket.data[i]}");
-                        }
-                        Console.CursorTop = cursorPosTop;
-                        Console.CursorLeft = cursorPosLeft;
-                        Console.CursorVisible = true;
-                    }
-                }
-                else if (id == 0x02)
-                {
+    static VibrPacket ParseVibr(Span<byte> span)
+    {
+        var pkt = new VibrPacket
+        {
+            Counter = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(4, 4))
+        };
 
-                }
-                else
-                {
-                    Console.Write(empty);
-                    Console.Write("\r");
-                    Console.ForegroundColor = ConsoleColor.DarkYellow;
-                    Console.Write($"Response: ");
-                    Console.ResetColor();
-                    Console.WriteLine($"{Encoding.ASCII.GetString(bytes)}");
-                    Console.Write(empty);
-                    Console.Write("\r");
-                }
-            }
-            else
+        var dataSpan = span.Slice(8);
+
+        for (int i = 0, j = 0; i < 8; i++)
+        {
+            if ((adcMask & (1 << i)) == 0)
+                continue;
+
+            int value = (dataSpan[j * 3] << 16) |
+                        (dataSpan[j * 3 + 1] << 8) |
+                         dataSpan[j * 3 + 2];
+            pkt.Data[i] = value;
+            j++;
+        }
+        return pkt;
+    }
+
+    static RtdPacket ParseRtd(Span<byte> span)
+    {
+        var pkt = new RtdPacket
+        {
+            Counter = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(4, 4))
+        };
+
+        var dataSpan = span.Slice(8);
+
+        for (int i = 0; i < 8; i++)
+        {
+            pkt.Data[i] = span[i] >> 8;
+        }
+        return pkt;
+    }
+
+    static async Task CmdLoggerLoop(string fileName = "cmd.log")
+    {
+        var reader = cmdChannel.Reader;
+        using var writer = new StreamWriter(fileName, append: true);
+
+        while (await reader.WaitToReadAsync())
+        {
+            while (reader.TryRead(out var cmd))
             {
-                Thread.Sleep(10);
+                string line = $"[{cmd.Timestamp:yyyy-MM-dd HH:mm:ss.fff}] {(cmd.IsIncoming ? "IN " : "OUT")} {cmd.Message}";
+                await writer.WriteLineAsync(line);
+                await writer.FlushAsync();
             }
         }
-
     }
 
-    public static void ParsePacketVibr(byte[] packet)
+    static async Task WriterVibr()
     {
-        vibrPacket.cnt = BitConverter.ToUInt32(packet, 4);
-
-        byte[] data = new byte[packet.Length - 8];
-        Array.Copy(packet, 8, data, 0, packet.Length - 8);
-
-        for (int i = 0; i < data.Length / 24; i += 3)
+        using var bw = new BinaryWriter(File.Open("vibr.bin", FileMode.Append));
+        var reader = vibrChannel.Reader;
+        while (await reader.WaitToReadAsync())
         {
-            byte[] temp = new byte[4] { 0, data[i + 2], data[i + 1], data[i] };
-            vibrPacket.data[i / 3] = BitConverter.ToInt32(temp, 0) / 256;
+            while (reader.TryRead(out var pkt))
+            {
+                bw.Write(pkt.Counter);
+                foreach (var v in pkt.Data) bw.Write(v);
+                if ((pkt.Counter % 1024) == 0)
+                    PrintStats(pkt);
+            }
         }
     }
 
-
-}
-
-public class MovingAverage
-{
-    private Queue<double> samples = new Queue<double>();
-    private int _windowSize = 16;
-    private double sampleAccumulator;
-
-    public MovingAverage(int windowSize)
+    static async Task WriterRtd()
     {
-        _windowSize = windowSize;
+        using var bw = new BinaryWriter(File.Open("rtd.bin", FileMode.Append));
+        var reader = rtdChannel.Reader;
+        while (await reader.WaitToReadAsync())
+        {
+            while (reader.TryRead(out var pkt))
+            {
+                bw.Write(pkt.Counter);
+                foreach (var v in pkt.Data) bw.Write(v);
+            }
+        }
     }
 
-    /// <summary>
-    /// Computes a new windowed average each time a new sample arrives
-    /// </summary>
-    /// <param name="newSample"></param>
-    public double Calc(double newSample)
+     static async Task SendCommandAsync(string cmdStr)
     {
-        sampleAccumulator += newSample;
-        samples.Enqueue(newSample);
+        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
 
-        if (samples.Count > _windowSize)
+        // создаём локальный буфер 8 байт
+        var buf = new byte[8];
+
+        // cmd7 — смена IP устройства
+        if (cmdStr.StartsWith("cmd7"))
         {
-            sampleAccumulator -= samples.Dequeue();
+            deviceIp = IPAddress.Parse(cmdStr[4..].Trim());
+            Encoding.ASCII.GetBytes("cmd7").CopyTo(buf, 0);
+            deviceIp.GetAddressBytes().CopyTo(buf, 4);
+
+            socket.SendTo(buf, new IPEndPoint(deviceIp, 2020));
+        }
+        else if (cmdStr.StartsWith("cmd5"))
+        {
+            uint val = Convert.ToUInt32(cmdStr[4..].Trim());
+            Encoding.ASCII.GetBytes("cmd5").CopyTo(buf, 0);
+            BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(4), val);
+
+            socket.SendTo(buf, new IPEndPoint(deviceIp, 2020));
+        }
+        else if (cmdStr.StartsWith("cmd6"))
+        {
+            uint val = Convert.ToUInt32(cmdStr[4..].Trim(), 2);
+            Encoding.ASCII.GetBytes("cmd6").CopyTo(buf, 0);
+            BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(4), val);
+
+            socket.SendTo(buf, new IPEndPoint(deviceIp, 2020));
+        }
+        else
+        {
+            // если обычная строка
+            var data = Encoding.ASCII.GetBytes(cmdStr);
+            socket.SendTo(data, new IPEndPoint(deviceIp, 2020));
         }
 
-        return sampleAccumulator / samples.Count;
+        // логируем отправку команды
+        await cmdChannel.Writer.WriteAsync(new CmdPacket
+        {
+            Timestamp = DateTime.Now,
+            Message = cmdStr,
+            IsIncoming = false
+        });
+    }
+
+    static void PrintStats(VibrPacket vibrPacket)
+    {
+        Console.Clear();
+
+        Console.WriteLine($"Queue: {vibrChannel.Reader.Count}");
+        Console.WriteLine($"Errors: {errCnt}");
+        Console.WriteLine($"Packets: {oldCnt}");
+
+        for (int i = 0; i < VIBR_ADC_CNT; i++)
+            Console.WriteLine($"Vibr{i + 1}: {vibrPacket.Data[i]}");
     }
 }
