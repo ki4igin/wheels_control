@@ -6,10 +6,9 @@ using System.Net;
 using System.Net.Sockets;
 using System.Text;
 using System.Threading.Channels;
-using static WheelsControl;
 
 public class VibrPacket(int adc)
-{    
+{
     public uint Counter;
     public int[] Data = new int[adc];
 }
@@ -52,76 +51,63 @@ public class WheelsControl
         public bool IsIncoming; // true = пришла, false = отправлена
     }
 
-    static readonly Channel<VibrPacket> vibrChannel = Channel.CreateUnbounded<VibrPacket>();
-    static readonly Channel<RtdPacket> rtdChannel = Channel.CreateUnbounded<RtdPacket>();
-    static readonly Channel<CmdPacket> cmdChannel = Channel.CreateUnbounded<CmdPacket>();
     static IPAddress deviceIp = IPAddress.Parse("192.168.0.10");
 
-    static uint oldCnt;
-    static uint errCnt;
-    static uint totalCnt;
+    static uint errVibrCnt;
+    static uint errRtdCnt;
 
-    static byte adcMask = 0x3F;
+    static byte vibrChMask = 0x3F;
 
     public static async Task Main()
     {
-        _ = Task.Run(ReceiveVibr);
-        _ = Task.Run(ReceiveRtd);
+        var vibrChannel = Channel.CreateBounded<byte[]>(
+            new BoundedChannelOptions(5000)
+            {
+                SingleReader = true,
+                SingleWriter = true
+            });
+        var rtdChannel = Channel.CreateBounded<byte[]>(
+            new BoundedChannelOptions(5000)
+            {
+                SingleReader = true,
+                SingleWriter = true
+            });
+
+        DataWriter vibrWriter = new("vibr");
+        DataWriter rtdWriter = new("rtd");
+
+
+        _ = Task.Run(() => ReceiveData(PORT_VIBR, vibrChannel.Writer));
+        _ = Task.Run(() => ReceiveData(PORT_RTD, rtdChannel.Writer));
+        _ = Task.Run(() => ParseTask(vibrChannel.Reader, vibrWriter.Writer, 256, ParseVibr));
+        _ = Task.Run(() => ParseTask(rtdChannel.Reader, rtdWriter.Writer, 1, ParseRtd));
         _ = Task.Run(ReceiveCmd);
 
         _ = Task.Run(() => CmdLoggerLoop());
-        _ = Task.Run(() => WriterRtd());
-        _ = Task.Run(() => WriterVibr());
 
         while (true)
         {
-            var line = Console.ReadLine();            
+            var line = Console.ReadLine();
             if (line != null)
             {
                 Console.CursorTop = 0;
                 Console.CursorLeft = 0;
-                Console.Write(Enumerable.Repeat(' ', line.Length).ToArray());
-                Console.Write("\r");
+                Console.Write(emptyString);
                 await SendCommandAsync(line);
             }
-                
+
         }
     }
 
-    static async Task ReceiveVibr()
+    static void ReceiveData(int port, ChannelWriter<byte[]> writer)
     {
-        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        socket.Bind(new IPEndPoint(IPAddress.Any, 2022));
-
+        using UdpClient udp = new(port);
+        udp.Client.ReceiveBufferSize = 16 * 1024 * 1024;
+        IPEndPoint ep = new(IPAddress.Any, port);
         while (true)
         {
-            byte[] buffer = ArrayPool<byte>.Shared.Rent(2048);
-            int received = await socket.ReceiveAsync(buffer, SocketFlags.None);
-            if (received != 440)
-            {
-               throw new Exception();
-            }
-            var pkt = ParseVibr(buffer.AsSpan(0, received));
-            await vibrChannel.Writer.WriteAsync(pkt);
-
-            ArrayPool<byte>.Shared.Return(buffer);
-        }
-    }
-
-    static async Task ReceiveRtd()
-    {
-        var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
-        socket.Bind(new IPEndPoint(IPAddress.Any, 2021));
-
-        while (true)
-        {
-            byte[] buffer = ArrayPool<byte>.Shared.Rent(2048);
-            int received = await socket.ReceiveAsync(buffer, SocketFlags.None);
-
-            var pkt = ParseRtd(buffer.AsSpan(0, received));
-            await rtdChannel.Writer.WriteAsync(pkt);
-
-            ArrayPool<byte>.Shared.Return(buffer);
+            var data = udp.Receive(ref ep);
+            writer.TryWrite(data);
         }
     }
 
@@ -148,50 +134,67 @@ public class WheelsControl
         }
     }
 
-    static VibrPacket ParseVibr(Span<byte> span)
+    static async Task ParseTask(ChannelReader<byte[]> reader, ChannelWriter<byte[]> writer, uint decimator, Action<byte[], uint> parser)
     {
-        uint cnt = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(4, 4));
-        var pkt = new VibrPacket
+        uint cnt = 0;
+        uint mask = decimator - 1;
+        await foreach (var packet in reader.ReadAllAsync())
         {
-            Counter = cnt
-        };
-        uint diff = cnt - oldCnt;
-        if (diff > 1)
-        {
-             errCnt++;
+            writer.TryWrite(packet);
+            if ((cnt & mask) == 0)
+            {
+                parser(packet, decimator);
+            }
         }
-        oldCnt = cnt;
-
-        var dataSpan = span.Slice(8, 6 * 3);
-
-        for (int i = 0, j = 0; i < 8; i++)
-        {
-            if ((adcMask & (1 << i)) == 0)
-                continue;
-
-            int value = (dataSpan[j * 3] << 16) |
-                        (dataSpan[j * 3 + 1] << 8) |
-                         dataSpan[j * 3 + 2];
-            pkt.Data[i] = value;
-            j++;
-        }
-        return pkt;
     }
 
-    static RtdPacket ParseRtd(Span<byte> span)
+    static uint oldCntVibrPac = 0;
+    static uint oldCntRtdPac = 0;
+
+    static void ParseVibr(byte[] data, uint decimator)
     {
-        var pkt = new RtdPacket
+        Span<byte> span = data;
+        uint cntPac = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(4, 4));
+        
+        uint diff = cntPac - oldCntVibrPac;
+        if (diff > decimator)
         {
-            Counter = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(4, 4))
-        };
+            errVibrCnt++;
+        }
+        oldCntVibrPac = cntPac;
 
         var dataSpan = span.Slice(8);
+        int[] vibrData = new int[8];
+        for (int i = 0, j = 0; i < 8; i++)
+        {
+            if ((vibrChMask & (1 << i)) == 0)
+                continue;
 
+            vibrData[i] = ReadInt24BigEndian(dataSpan.Slice(j * 3, 3));
+            j++;
+        }
+        PrintVibr(errVibrCnt, cntPac, vibrData.AsSpan());
+
+    }
+
+    static void ParseRtd(byte[] data, uint decimator)
+    {
+        Span<byte> span = data;
+        uint cntPac = BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(4, 4));
+
+        uint diff = cntPac - oldCntRtdPac;
+        if (diff > decimator)
+        {
+            errRtdCnt++;
+        }
+        oldCntRtdPac = cntPac;
+        var dataSpan = span.Slice(8);
+        int[] rtdData = new int[8];
         for (int i = 0; i < 8; i++)
         {
-            pkt.Data[i] = BinaryPrimitives.ReadInt32BigEndian(dataSpan.Slice(i*4));
+            rtdData[i] = BinaryPrimitives.ReadInt32BigEndian(dataSpan.Slice(i * 4));
         }
-        return pkt;
+        PrintRtd(errRtdCnt, cntPac, rtdData.AsSpan());
     }
 
     static async Task CmdLoggerLoop(string fileName = "cmd.log")
@@ -210,39 +213,7 @@ public class WheelsControl
         }
     }
 
-    static async Task WriterVibr()
-    {
-        using var bw = new BinaryWriter(File.Open("vibr.bin", FileMode.Append));
-        var reader = vibrChannel.Reader;
-        while (await reader.WaitToReadAsync())
-        {
-            while (reader.TryRead(out var pkt))
-            {
-                bw.Write(pkt.Counter);
-                foreach (var v in pkt.Data) bw.Write(v);
-                if ((pkt.Counter % 1024) == 0)
-                    PrintStats(pkt);
-            }
-        }
-    }
-
-    static async Task WriterRtd()
-    {
-        using var bw = new BinaryWriter(File.Open("rtd.bin", FileMode.Append));
-        var reader = rtdChannel.Reader;
-        while (await reader.WaitToReadAsync())
-        {
-            while (reader.TryRead(out var pkt))
-            {
-                bw.Write(pkt.Counter);
-                foreach (var v in pkt.Data) bw.Write(v);
-                if ((pkt.Counter % 16) == 0)
-                    PrintStats(pkt);
-            }
-        }
-    }
-
-     static async Task SendCommandAsync(string cmdStr)
+    static async Task SendCommandAsync(string cmdStr)
     {
         var socket = new Socket(AddressFamily.InterNetwork, SocketType.Dgram, ProtocolType.Udp);
 
@@ -276,8 +247,10 @@ public class WheelsControl
         }
         else if (cmdStr.StartsWith("cmd2"))
         {
-            oldCnt = 0;
-            errCnt = 0;
+            oldCntVibrPac = 0;
+            oldCntRtdPac = 0;
+            errVibrCnt = 0;
+            errRtdCnt = 0;
             var data = Encoding.ASCII.GetBytes(cmdStr);
             socket.SendTo(data, new IPEndPoint(deviceIp, 2020));
         }
@@ -296,8 +269,9 @@ public class WheelsControl
             IsIncoming = false
         });
     }
+
     private static readonly object consoleLock = new object();
-    static void PrintStats(VibrPacket vibrPacket)
+    static void PrintVibr(uint errCnt, uint cntPac, ReadOnlySpan<int> data)
     {
         //Console.Clear();
         lock (consoleLock)
@@ -308,11 +282,10 @@ public class WheelsControl
             Console.CursorVisible = false;
 
             Console.CursorTop = 3;
-            Console.WriteLine($"{emptyString}Queue   : {vibrChannel.Reader.Count}");
             Console.WriteLine($"{emptyString}Errors  : {errCnt}");
-            Console.WriteLine($"{emptyString}Packets : {vibrPacket.Counter}");
+            Console.WriteLine($"{emptyString}Packets : {cntPac}");
             for (int i = 0; i < VIBR_ADC_CNT; i++)
-                Console.WriteLine($"{emptyString}Vibr{i + 1}: {vibrPacket.Data[i]}");
+                Console.WriteLine($"{emptyString}Vibr{i + 1}: {data[i]}");
 
             Console.CursorLeft = cursorPosLeft;
             Console.CursorTop = cursorPosTop;
@@ -320,7 +293,7 @@ public class WheelsControl
         }
     }
 
-    static void PrintStats(RtdPacket rtdPacket)
+    static void PrintRtd(uint errCnt, uint cntPac, ReadOnlySpan<int> data)
     {
         //Console.Clear();
         lock (consoleLock)
@@ -333,11 +306,11 @@ public class WheelsControl
             Console.CursorTop = 14;
 
             Console.WriteLine();
-            Console.WriteLine($"{emptyString}Queue   : {rtdChannel.Reader.Count}");
-            Console.WriteLine($"{emptyString}Packets : {rtdPacket.Counter}");
+            Console.WriteLine($"{emptyString}Errors  : {errCnt}");
+            Console.WriteLine($"{emptyString}Packets : {cntPac}");
 
             for (int i = 0; i < RTD_ADC_CNT; i++)
-                Console.WriteLine($"{emptyString}RTD{i + 1} : {AdcData2temperatyre(rtdPacket.Data[i])}");
+                Console.WriteLine($"{emptyString}RTD{i + 1} : {AdcData2temperatyre(data[i])}");
 
             Console.CursorLeft = cursorPosLeft;
             Console.CursorTop = cursorPosTop;
@@ -355,4 +328,11 @@ public class WheelsControl
         double temperature = 1 / (alpha * R0) * (adcData / 256 / ((1U << 22) * Gain) * Rref - R0);
         return temperature;
     }
+
+    static int ReadInt24BigEndian(ReadOnlySpan<byte> span)
+    {
+        return (span[0] << 16) | (span[1] << 8) | span[2];
+    }
 }
+
+
